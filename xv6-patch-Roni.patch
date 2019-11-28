@@ -1,0 +1,237 @@
+diff -ruN ./xv6-public-src/defs.h ./xv6-public/defs.h
+--- ./xv6-public-src/defs.h	2019-11-27 20:42:25.950688000 +0200
++++ ./xv6-public/defs.h	2019-11-27 23:27:25.296970056 +0200
+@@ -155,6 +155,11 @@
+ int             fetchint(uint, int*);
+ int             fetchstr(uint, char**);
+ void            syscall(void);
++void            scinit(void);
++extern uint     reads;
++extern struct spinlock readslock;
++extern uint     calls[];
++extern struct spinlock callslock;
+ 
+ // timer.c
+ void            timerinit(void);
+diff -ruN ./xv6-public-src/main.c ./xv6-public/main.c
+--- ./xv6-public-src/main.c	2019-11-27 20:42:25.950688000 +0200
++++ ./xv6-public/main.c	2019-11-27 22:00:48.674659900 +0200
+@@ -27,6 +27,7 @@
+   consoleinit();   // console hardware
+   uartinit();      // serial port
+   pinit();         // process table
++  scinit();        // init syscall counter
+   tvinit();        // trap vectors
+   binit();         // buffer cache
+   fileinit();      // file table
+diff -ruN ./xv6-public-src/Makefile ./xv6-public/Makefile
+--- ./xv6-public-src/Makefile	2019-11-27 20:42:25.950688000 +0200
++++ ./xv6-public/Makefile	2019-11-27 23:27:05.440937809 +0200
+@@ -181,6 +181,9 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++        _test_count\
++        _test_count_for\
++        _test_call_count\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff -ruN ./xv6-public-src/syscall.c ./xv6-public/syscall.c
+--- ./xv6-public-src/syscall.c	2019-11-27 20:42:25.954688000 +0200
++++ ./xv6-public/syscall.c	2019-11-27 23:26:13.888863551 +0200
+@@ -6,6 +6,7 @@
+ #include "proc.h"
+ #include "x86.h"
+ #include "syscall.h"
++#include "spinlock.h"
+ 
+ // User code makes a system call with INT T_SYSCALL.
+ // System call number in %eax.
+@@ -13,6 +14,23 @@
+ // library system call function. The saved user %esp points
+ // to a saved program counter, and then the first argument.
+ 
++struct spinlock readslock;
++uint reads;
++struct spinlock calllock;
++uint calls[SYS_CALL_AMOUNT + 1];
++
++// Init syscall counter
++void
++scinit(void)
++{
++  reads = 0;
++  for (int i = 0; i < SYS_CALL_AMOUNT + 1; i++) {
++    calls[i] = 0;
++  }
++  initlock(&readslock, "time");
++  initlock(&calllock, "calls");
++}
++
+ // Fetch the int at addr from the current process.
+ int
+ fetchint(uint addr, int *ip)
+@@ -103,6 +121,8 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_readcount(void);
++extern int sys_callcount(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +146,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_readcount] sys_readcount,
++[SYS_callcount] sys_callcount,
+ };
+ 
+ void
+@@ -135,6 +157,18 @@
+   struct proc *curproc = myproc();
+ 
+   num = curproc->tf->eax;
++  // If call is read add it to the counter
++  if (syscalls[num] == sys_read) {
++      acquire(&readslock);
++      reads++;
++      release(&readslock);
++  }
++  // Calculate all syscall amount
++  if (num < SYS_CALL_AMOUNT + 1)  {
++    acquire(&calllock);
++    calls[num]++;
++    release(&calllock);
++  }
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+     curproc->tf->eax = syscalls[num]();
+   } else {
+diff -ruN ./xv6-public-src/syscall.h ./xv6-public/syscall.h
+--- ./xv6-public-src/syscall.h	2019-11-27 20:42:25.954688000 +0200
++++ ./xv6-public/syscall.h	2019-11-28 00:05:34.835032055 +0200
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_readcount  22
++#define SYS_callcount  23
++
++#define SYS_CALL_AMOUNT 23
+diff -ruN ./xv6-public-src/sysproc.c ./xv6-public/sysproc.c
+--- ./xv6-public-src/sysproc.c	2019-11-27 20:42:25.954688000 +0200
++++ ./xv6-public/sysproc.c	2019-11-28 00:02:52.257940290 +0200
+@@ -6,6 +6,7 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "proc.h"
++#include "syscall.h"
+ 
+ int
+ sys_fork(void)
+@@ -89,3 +90,23 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_readcount(void)
++{
++  return reads;
++}
++
++int
++sys_callcount(void)
++{
++  int arg = 0;
++  argint(0, &arg);
++  if (arg < SYS_CALL_AMOUNT + 1) {
++    return calls[arg];
++  }
++  else {
++    return -1;
++  }
++}
++
+diff -ruN ./xv6-public-src/test_call_count.c ./xv6-public/test_call_count.c
+--- ./xv6-public-src/test_call_count.c	1970-01-01 02:00:00.000000000 +0200
++++ ./xv6-public/test_call_count.c	2019-11-28 00:02:42.249869522 +0200
+@@ -0,0 +1,16 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int
++main(int argc, char *argv[])
++{
++  // Print call count acording to argument
++  if (argc == 1) {
++    printf(1, "This program requires numeric argument.\n");
++    exit();
++  }
++  int argument = atoi(argv[1]);
++  printf(1, "Callcount: %d\n", callcount(argument));
++  exit();
++}
+diff -ruN ./xv6-public-src/test_count.c ./xv6-public/test_count.c
+--- ./xv6-public-src/test_count.c	1970-01-01 02:00:00.000000000 +0200
++++ ./xv6-public/test_count.c	2019-11-27 21:13:48.490457360 +0200
+@@ -0,0 +1,10 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int
++main(int argc, char *argv[])
++{
++  printf(1, "Readcount: %d\n", readcount());
++  exit();
++}
+diff -ruN ./xv6-public-src/test_count_for.c ./xv6-public/test_count_for.c
+--- ./xv6-public-src/test_count_for.c	1970-01-01 02:00:00.000000000 +0200
++++ ./xv6-public/test_count_for.c	2019-11-27 22:15:03.266090208 +0200
+@@ -0,0 +1,21 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++char buf[2];
++
++int
++main(int argc, char *argv[])
++{
++  int fd;
++  if((fd = open("cat", 0)) < 0){
++      printf(1, "readcount_test_for: cannot open cat\n");
++      exit();
++  }
++  // Read exactly 100 times.
++  for (int i = 0; i < 1000; i++) {
++    read(fd, buf, sizeof(buf));
++  }
++  printf(1, "Readcount: %d\n", readcount());
++  exit();
++}
+diff -ruN ./xv6-public-src/user.h ./xv6-public/user.h
+--- ./xv6-public-src/user.h	2019-11-27 20:42:25.954688000 +0200
++++ ./xv6-public/user.h	2019-11-27 23:48:56.673168283 +0200
+@@ -23,6 +23,8 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int readcount(void);
++int callcount(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff -ruN ./xv6-public-src/usys.S ./xv6-public/usys.S
+--- ./xv6-public-src/usys.S	2019-11-27 20:42:25.954688000 +0200
++++ ./xv6-public/usys.S	2019-11-27 23:35:03.162121661 +0200
+@@ -29,3 +29,5 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(readcount)
++SYSCALL(callcount)
